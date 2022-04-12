@@ -1,0 +1,227 @@
+pipeline {
+    agent any
+    environment {
+		service="workflow-runtime-service"
+		def workspace = pwd()
+		namespace="workflow"
+		Branch="${env.gitlabTargetBranch}"
+	}
+    stages {
+		stage('Clean'){
+			steps {
+				echo "0.Delete workspace before build starts"
+				step([$class: 'WsCleanup'])
+			}
+		}
+
+		stage('Clone') {
+			steps {
+				echo "1.Clone Stage"
+				dir('workflow-common'){
+					git branch: 'develop', credentialsId: 'lulongchao', url: 'http://192.100.30.115:9000/job_workflow_platform/workflow-common.git'
+				}
+				
+				dir('workflow-external-integration-plugin'){
+					git branch: 'develop', credentialsId: 'lulongchao', url: 'http://192.100.30.115:9000/job_workflow_platform/workflow-external-integration-plugin.git'
+				}
+				dir('workflow-parent'){
+					git branch: 'main', credentialsId: 'lulongchao', url: 'http://192.100.30.115:9000/job_workflow_platform/workflow-parent.git'
+				}
+				dir('workflow-runtime-service'){
+					git branch: 'develop', credentialsId: 'lulongchao', url: 'http://192.100.30.115:9000/job_workflow_platform/workflow-runtime-service.git'
+					script {
+						commit_tag = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+						build_tag = "${commit_tag}-${BUILD_NUMBER}"
+					}
+				}
+			}
+
+		}
+		stage('Package') {
+			steps {
+				echo "2. Maven Package"
+				sh """
+				cd $workspace/workflow-common
+				mvn clean  -Dmaven.test.skip=true deploy
+				cd $workspace/workflow-parent
+				mvn clean  -Dmaven.test.skip=true deploy
+				cd $workspace/workflow-external-integration-plugin
+				mvn clean  -Dmaven.test.skip=true deploy
+			 
+				cd $workspace/workflow-runtime-service
+				mvn clean  -Dmaven.test.skip=true deploy
+				"""
+			}
+		}
+		stage('Build') {
+			steps {
+				echo "3.Build Docker Image Stage"
+				dir("workflow-runtime-service") {
+					script {
+						jarname = sh(returnStdout: true, script: 'ls ./target/ | grep  ".jar$"').trim()
+					}
+				sh """
+				cat >Dockerfile<<-EOF
+					FROM openjdk:8-jdk-alpine
+					MAINTAINER rocos <rockstics@gmail.com>
+					ENV LANG en_US.UTF-8
+					ENV LANGUAGE en_US:en
+					ENV LC_ALL en_US.UTF-8
+					RUN mkdir /app
+					ENV TZ=Asia/Hong_Kong
+					WORKDIR /app
+					COPY target/<SECNAME> /app/app.jar
+					EXPOSE 8060
+					ENTRYPOINT ["java","-jar","/app/app.jar"]
+				EOF
+				cat Dockerfile 
+				cat >deployment.yaml<<-EOF
+				apiVersion: apps/v1
+				kind: Deployment
+				metadata:
+				  labels:
+				    app: <SECNAME>
+				  name: <SECNAME>
+				  namespace: <NAMESPACE>
+				spec:
+				  replicas: 1
+				  selector:
+				    matchLabels:
+				      app: <SECNAME>
+				  template:
+				    metadata:
+				      labels:
+				        app: <SECNAME>
+				    spec:
+				      containers:
+				        - image: <IMAGE>:<IMAGETAG>
+				          name: <SECNAME>
+				          env:
+				          - name: PLATFORM_KEY
+				            value: ExcellentSiact666
+				          - name: TZ
+				            value: Asia/Hong_Kong
+				EOF
+				cat deployment.yaml
+				sed -i 's/<SECNAME>/${jarname}/' Dockerfile
+				"""
+				echo "service:build_tag  ${service}:${build_tag}"
+				sh """
+				sudo docker build -t 192.100.30.160:9000/${service}:${build_tag} .
+				"""
+				}
+			}
+		}
+		stage('Push') {
+			steps {
+				echo "4.Push Docker Image Stage"
+				withCredentials([usernamePassword(credentialsId: 'dockerHub', passwordVariable: 'dockerHubPassword', usernameVariable: 'dockerHubUser')]) {
+					sh """ 
+					sudo docker login -u ${dockerHubUser} -p ${dockerHubPassword} http://192.100.30.160:9000
+					sudo docker push 192.100.30.160:9000/${service}:${build_tag}
+					"""
+				}
+			}
+		}
+
+		stage('Deploy') {
+			steps {
+				echo "5. Deploy Stage"
+				echo "This is a deploy step "
+				dir("workflow-runtime-service") {
+					sh """
+					sed -i 's/<IMAGETAG>/${build_tag}/' deployment.yaml
+					sed -i 's@<IMAGE>@192.100.30.160:9000/${service}@' deployment.yaml
+					sed -i 's/<SECNAME>/${service}/' deployment.yaml
+					sed -i 's/<NAMESPACE>/${namespace}/' deployment.yaml
+					cat deployment.yaml
+					"""
+					echo "远程执行kubectl apply -f deployment.yaml"
+					sh "sudo kubectl apply -f deployment.yaml"
+				}
+			}
+		}
+		stage('Check') {
+			steps {
+				echo "5.校验程序是否部署成功"
+				sh """
+				sudo kubectl get pod -n ${namespace}
+				"""
+			}
+		}
+	}
+    post {
+        success {
+            script {
+				if ( "${Branch}" == 'null' ) {
+                    dingtalk (
+                        robot: '3f9a7477-8b62-441b-9b49-5fa3cf6c1f89',
+                        type: 'MARKDOWN',
+                        title: 'Jenkins构建通知',
+                        text: [
+                            "# <font color=\"#80FF00\">CI/CD执行成功</font>",
+			        		'---',
+			        		"- 服务名称：${JOB_BASE_NAME}",
+			        		"- 发版方式：手动 ",
+			        		"- 任务ID：[${BUILD_ID}](${RUN_DISPLAY_URL})",
+			        		"- 发布状态：<font color=\"#80FF00\">成功</font> "
+                        ],
+                        at: []
+                    )
+				}
+			    else {
+			        dingtalk (
+                            robot: '3f9a7477-8b62-441b-9b49-5fa3cf6c1f89',
+                            type: 'MARKDOWN',
+                            title: 'Jenkins构建通知',
+                            text: [
+                                 "# <font  color=\"#80FF00\">CI/CD执行成功</font>",
+			            		'---',
+			            		"- 服务名称：${JOB_BASE_NAME}",
+			            		"- 发版方式：GitLab WebHook",
+			            		"- 任务ID：[${BUILD_ID}](${RUN_DISPLAY_URL})",
+			            		"- 发布状态：<font  color=\"#80FF00\">成功</font> "
+                            ],
+                            at: []
+                    )
+			    }
+            }
+        }
+        failure {
+            script {
+				if ( "${Branch}" == 'null' ) {
+                    dingtalk (
+                        robot: '3f9a7477-8b62-441b-9b49-5fa3cf6c1f89',
+                        type: 'MARKDOWN',
+                        title: 'Jenkins 发布通知',
+                        text: [
+                            "# <font  color=\"#FF0000\">CI/CD执行失败</font>",
+			        		'---',
+			        		"- 服务名称：${JOB_BASE_NAME}",
+			        		"- 发版方式：手动",
+			        		"- 任务ID：[${BUILD_ID}](${RUN_DISPLAY_URL})",
+			        		"- 发布状态：<font color=\"#FF0000\">失败</font>"
+                        ],
+                        at: []
+                    )
+				}
+				else {
+				    dingtalk (
+                        robot: '3f9a7477-8b62-441b-9b49-5fa3cf6c1f89',
+                        type: 'MARKDOWN',
+                        title: 'Jenkins 发布通知',
+                        text: [
+                            "# <font color=\"#FF0000\">CI/CD执行失败</font>",
+			        		'---',
+			        		"- 服务名称：${JOB_BASE_NAME}",
+			        		"- 发版方式：GitLab WebHook",
+			        		"- 任务ID：[${BUILD_ID}](${RUN_DISPLAY_URL})",
+			        		"- 发布状态：<font color=\"#FF0000\">失败</font>"
+                        ],
+                        at: []
+                    )
+				}
+			}
+        }
+    }
+}
